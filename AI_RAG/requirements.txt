@@ -1,0 +1,11 @@
+llama-index-core>=0.10.20
+llama-index-llms-ollama
+llama-index-embeddings-huggingface
+llama-index-readers-file
+transformers
+torch
+huggingface-hub
+tqdm
+# Optional: for PDF/office document support in SimpleDirectoryReader
+pdfminer.six
+python-docx
