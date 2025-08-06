@@ -1,38 +1,87 @@
+import warnings
+
+# Suppress FutureWarnings and UserWarnings (especially from torch/HF)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings(
+    "ignore",
+    message=".*encoder_attention_mask.*BertSdpaSelfAttention.*",
+    category=FutureWarning
+)
+
 import os
+import sys
 import time
 import argparse
 
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings, StorageContext, load_index_from_storage
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.ollama import Ollama
 
 # === Configurations ===
 DATA_DIR = 'data'
-MODEL = 'llama3.2'
+PERSIST_DIR = 'index_store'               # Where the index is persisted
+MODEL = 'llama3'                          # Change if your Ollama model differs
+
+SYSTEM_PROMPT = (
+    "You are a helpful, conversational AI assistant. "
+    "Only reference the user's files and documents if the user asks about them. "
+    "Otherwise, focus on casual, friendly, open-ended conversation."
+)
 
 Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-base-en-v1.5")
 llm = Ollama(model=MODEL, request_timeout=360.0)
 Settings.llm = llm
 
-def build_index(data_dir):
-    # Make sure data dir exists
+def build_or_load_index(data_dir, persist_dir):
+    """Load a persisted index if available, otherwise build and persist it."""
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
         print(f"Created directory '{data_dir}'. Put your files there and re-run this script.")
-        exit(1)
+        sys.exit(1)
+
+    if os.path.exists(persist_dir):
+        try:
+            print("Loading existing index from disk...")
+            storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
+            index = load_index_from_storage(storage_context)
+            print("Index loaded from disk.")
+            return index
+        except Exception as e:
+            print(f"Failed to load index from {persist_dir}: {e}")
+            print("Rebuilding index from scratch.")
+
     print(f"Indexing files in '{data_dir}' ...")
     docs = SimpleDirectoryReader(data_dir).load_data()
     index = VectorStoreIndex.from_documents(docs)
-    print(f"Indexed {len(docs)} files.")
+    index.storage_context.persist(persist_dir=persist_dir)
+    print(f"Indexed {len(docs)} files and saved to '{persist_dir}'.")
     return index
 
 def chat_loop(index, verbose=False):
-    # Build a chat engine with streaming enabled
+    # Build a chat engine with streaming and a system prompt (if supported)
     try:
-        chat_engine = index.as_chat_engine(llm=llm, chat_mode="context", stream=True)
+        chat_engine = index.as_chat_engine(
+            llm=llm,
+            chat_mode="context",
+            stream=True,
+            system_prompt=SYSTEM_PROMPT
+        )
     except TypeError:
-        # Fallback for older versions
-        chat_engine = index.as_chat_engine(llm=llm, chat_mode="context")
+        # Fallback: if system_prompt kwarg missing, try other alternatives, or run without it
+        try:
+            chat_engine = index.as_chat_engine(
+                llm=llm,
+                chat_mode="context",
+                stream=True,
+                system_message=SYSTEM_PROMPT
+            )
+        except TypeError:
+            chat_engine = index.as_chat_engine(
+                llm=llm,
+                chat_mode="context",
+                stream=True
+            )
 
     print("\nChat session started! Type 'exit' to quit. Type 'verbose on' / 'verbose off' to toggle stats.\n")
 
@@ -50,23 +99,18 @@ def chat_loop(index, verbose=False):
             continue
 
         t0 = time.time()
-
-        # Try streaming the model's response, fallback to non-streaming
         try:
             response_stream = chat_engine.chat(user_input, stream=True)
         except TypeError:
-            # If streaming is unsupported, fallback
             response_stream = [chat_engine.chat(user_input)]
 
         print("\nAI: ", end="", flush=True)
         full_response = ""
         for chunk in response_stream:
-            # The chunk object/field may depend on your model; adapt as needed
-            # chunk could be a string or a response object with `.response`
             text = getattr(chunk, "response", None) or getattr(chunk, "text", None) or str(chunk)
             print(text, end="", flush=True)
             full_response += text
-        print("\n")  # AI output end
+        print("\n")
 
         t1 = time.time()
         elapsed = t1 - t0
@@ -91,6 +135,9 @@ if __name__ == "__main__":
     print("""
 ==== CLI Chat Demo ====
 Drop files (txt, pdf, md, etc) into the './data' folder.
+
+* The vector index will be loaded from disk if available,
+  otherwise it will be built and persisted for future runs.
 """)
-    index = build_index(DATA_DIR)
+    index = build_or_load_index(DATA_DIR, PERSIST_DIR)
     chat_loop(index, verbose=args.verbose)
